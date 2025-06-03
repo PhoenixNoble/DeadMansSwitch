@@ -12,8 +12,10 @@ Windows locks PC if:
 * A write or read event fails
 
 Parts about $10~$15
-USB Cable and Header - https://www.aliexpress.com/item/1005003258136990.html
-ESP32 S3 WROOM - https://www.mouser.se/ProductDetail/356-ESP32-S3WROOM1N8
-
+2*RP2040-Zero [$2.5] - https://www.aliexpress.com/item/1005007393402333.html
+2*USB-C Magnetic Connector [$6] - https://www.aliexpress.com/item/1005007377094512.html
+5*Magnetic USB C Female [$2.5] - https://www.aliexpress.com/item/1005007551406455.html
+10*Carabiner Clips [$3] - https://www.aliexpress.com/item/1005007462779944.html
+50pcs Lanyard Strap [$2.5] - https://www.aliexpress.com/item/1005005064543945.html
 
 I became aware of https://www.buskill.in/ after starting this project
