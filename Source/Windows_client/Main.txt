@@ -1,0 +1,465 @@
+using System.Collections.Generic;
+using System.IO.Ports;
+using System.Management;
+using System.Runtime.InteropServices;
+using System.Xml.Linq;
+
+namespace MyApp
+{
+    internal class Program
+    {
+        // used to catch the event when the program closes
+        static ConsoleEventDelegate? handler;   // Keeps it from getting garbage collected
+        private delegate bool ConsoleEventDelegate(int eventType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleCtrlHandler(ConsoleEventDelegate callback, bool add);
+
+        // import function for locking the PC
+        [DllImport("user32.dll")]
+        public static extern bool LockWorkStation();
+
+        // struct for holding COM port name and the VID and PID of enumerated devices
+        // so the user can pick and we can save the info
+        private struct ComPortsData
+        {
+            public String name;
+            public String VID;
+            public String PID;
+            public ComPortsData() { name = "XXXX"; VID = "XXXX"; PID = "XXXX"; }
+        }
+
+        private class ComPortsDataEqualityComparer : IEqualityComparer<ComPortsData>
+        {
+            public bool Equals(ComPortsData cpd1, ComPortsData cpd2)
+            {
+                return cpd1.VID == cpd2.VID && cpd1.PID == cpd2.PID;
+            }
+
+            public int GetHashCode(ComPortsData cpd)
+            {
+                return cpd.VID.GetHashCode() + cpd.PID.GetHashCode();
+            }
+
+        }
+        private static ComPortsDataEqualityComparer comparer = new();
+
+        // Used to store settings from the file, allows for atuo run without picking com port each time
+        private class AppSettings
+        {
+            public HashSet<ComPortsData> knownDevices = new HashSet<ComPortsData>(comparer);
+        }
+        static AppSettings settings = new AppSettings();
+
+        // most of there are used cross thread and either read into or written to only on one thread
+        const string _writeMessage = "DMS"; // message to send to serial device
+        static long lastRead = 0; // time last read occured
+        static bool _armed = false; // the program will only lock the machine once its found a device and started reciveing the same message
+        static bool _continue = false; // used for the main apps loop to keep it running forever
+        static bool _waitForResponce = false; // used to slow down communication so that the message is only sent and recieved every so often
+        static SerialPort? _serialPort = null; // the serial port connection
+        static Thread? writeThread = null;
+        static Thread? readThread = null;
+        static bool LOGOUT = false; // flag set on any thread that causes the main thread to call logout and shutdown the threads and kill the serial connection
+
+        static void Main(string[] args)
+        {
+            handler = new ConsoleEventDelegate(ConsoleEventCallback);
+            if(handler != null)
+                SetConsoleCtrlHandler(handler, true);
+
+            LoadSettingsFile();
+            while (!_continue)
+                CreateSerialConnection();
+
+            while (_continue)
+            {
+                if (LOGOUT)
+                {
+                    LockWindows();
+                    LOGOUT = false;
+                }
+                if (_serialPort == null)
+                    CreateSerialConnection();
+            }
+
+            // join the read and write threads and close the serial port before we exit
+            if (readThread != null)
+                readThread.Join();
+            if (writeThread != null)
+                writeThread.Join();
+            if (_serialPort != null)
+                _serialPort.Close();
+        }
+
+        static void CreateSerialConnection()
+        {
+            lastRead = 0;
+            _waitForResponce = false;
+
+            // Create a new SerialPort object with default settings.
+            _serialPort = new SerialPort();
+
+            // Most of these are defaults and the baud rate is set to the same on the DMS device
+            _serialPort.PortName = SetPortName(_serialPort.PortName);
+            _serialPort.BaudRate = 115200;
+            _serialPort.Parity = Parity.None;
+            _serialPort.DataBits = 8;
+            _serialPort.StopBits = StopBits.One;
+            _serialPort.Handshake = Handshake.None;
+
+            // Set the write timeouts
+            _serialPort.WriteTimeout = 500;
+            _serialPort.DtrEnable = true;
+
+            // callbacks for recieving data and errors
+            _serialPort.ErrorReceived += new SerialErrorReceivedEventHandler(myport_ErrorReceived);
+            _serialPort.DataReceived += new SerialDataReceivedEventHandler(myport_DataReceived);
+
+            // open the serial port
+            try
+            {
+                _serialPort.Open();
+            }
+            catch (Exception e)
+            {
+                _serialPort = null;
+                Console.WriteLine("Exception: " + e.Message);
+                return;
+            }
+
+            writeThread = new Thread(Write); // thread to write to serial
+            readThread = new Thread(Read); // thread to read from serial
+
+            // set _continue so the main app loops and start the read and write threads
+            _continue = true;
+
+            readThread.Start();
+            writeThread.Start();
+        }
+
+        static void CloseSerialConnection()
+        {
+            readThread = null;
+            writeThread = null;
+            if (_serialPort != null)
+                _serialPort.Close();
+            _serialPort = null;
+        }
+
+        // write settings to file, these can be blank of the VID and PID of the device on the chosen COM port
+        private static void writeSettingsFile()
+        {
+            try
+            {
+                StreamWriter sw = new StreamWriter("Settings.txt");
+
+                foreach (ComPortsData kd in settings.knownDevices)
+                {
+                    sw.WriteLine("VID:" + kd.VID + ",PID:" + kd.PID);
+                }
+
+                sw.Close();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Exception: " + e.Message);
+            }
+        }
+
+        // Firstly check if the file exists, if it doesnt write a blank one
+        // load the settings file, this will load default values of XXXX for
+        // VID and PID untill the user picks a COM port at which point the
+        // values are saved so COM port changing doesnt matter the device
+        // is remembered even if COM port number changes
+        private static void LoadSettingsFile()
+        {
+            if (File.Exists("Settings.txt") == false)
+            {
+                writeSettingsFile();
+            }
+
+            String? line;
+            try
+            {
+                //Pass the file path and file name to the StreamReader constructor
+                StreamReader sr = new StreamReader("Settings.txt");
+                //Read the first line of text
+                line = sr.ReadLine();
+                //Continue to read until you reach end of file
+                while (line != null)
+                {
+                    ComPortsData kd = new ComPortsData();
+                    string[] parts = line.Split(",");
+                    foreach (string part in parts)
+                    {
+                        if (part.StartsWith("VID:"))
+                        {
+                            kd.VID = part.Substring(4, part.Length - 4);
+                        }
+                        else if (part.StartsWith("PID:"))
+                        {
+                            kd.PID = part.Substring(4, part.Length - 4);
+                        }
+                    }
+                    settings.knownDevices.Add(kd);
+
+                    //Read the next line
+                    line = sr.ReadLine();
+                }
+
+                sr.Close();
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("Exception: " + e.Message);
+            }
+        }
+
+        // Function to wrap windows function with the _armed check
+        // just log if debugging
+        private static void LockWindows()
+        {
+            CloseSerialConnection();
+
+            if (_armed)
+            {
+#if DEBUG
+                Console.WriteLine("LockWorkStation");
+#else
+                LockWorkStation();
+#endif
+                _armed = false;
+            }
+        }
+
+        // catch the app closing and force a logout if armed
+        private static bool ConsoleEventCallback(int eventType)
+        {
+            if (eventType == 2)
+            {
+                if(readThread != null)
+                    readThread.Join();
+                if (writeThread != null)
+                    writeThread.Join();
+                if (_serialPort != null)
+                    _serialPort.Close();
+
+                LOGOUT = true;
+            }
+            return false;
+        }
+
+
+        // if an error is recieved on the COM port like its disconected then lock
+        private static void myport_ErrorReceived(object sender, SerialErrorReceivedEventArgs e)
+        {
+            LOGOUT = true;
+        }
+
+        // windows callback when a serial message is recieved
+        // cache now as read time and arm the program if its
+        // not allready and we recieve the correct responce
+        private static void myport_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            string readMessage = ""; // message recieved from device
+            lastRead = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            _waitForResponce = false;
+
+            if (_serialPort != null)
+            {
+                try
+                {
+                    readMessage = _serialPort.ReadExisting();
+                    if (!_armed)
+                    {
+                        if (readMessage.Contains(_writeMessage))
+                        {
+                            _armed = true;
+                            Console.WriteLine("_armed = true");
+                        }
+                    }
+                }
+                catch (Exception except)
+                {
+                    Console.WriteLine("Exception: " + except.Message);
+                    LOGOUT = true;
+                }
+#if DEBUG
+                //Console.WriteLine(readMessage);
+#endif
+            }
+        }
+
+        // this function doesnt really read it checks the difference between
+        // now and the least read time and locks if its been to long
+        private static void Read()
+        {
+            while (_continue)
+            {
+                if ( lastRead > 0 && (DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond) - lastRead > 200)                
+                {
+                    LOGOUT = true;
+                }
+
+                Thread.Sleep(25);
+            }
+        }
+
+        // send the DMS write message then sleep a little and send again
+        private static void Write()
+        {
+            while (_continue)
+            {
+                if (!_waitForResponce)
+                {
+                    try
+                    {
+                        if (_serialPort != null && _serialPort.IsOpen)
+                        {
+                            _waitForResponce = true;
+                            _serialPort.WriteLine(_writeMessage);
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine("Exception: " + e.Message);
+                        LOGOUT = true;
+                    }
+                }
+                Thread.Sleep(150);
+            }
+        }
+
+        private static string GetPorts(ref List<ComPortsData> ports)
+        {
+            string portName = "";
+            using (var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PnPEntity WHERE Caption like '%(COM%'"))
+            {
+                var portnames = SerialPort.GetPortNames();
+                foreach (var port in searcher.Get().Cast<ManagementBaseObject>().ToList())
+                {
+                    ComPortsData cpd = new ComPortsData();
+
+                    string? tmpName = "";
+                    var caption = port.Properties["Caption"].Value;
+                    if (caption != null)
+                    {
+                        Console.Write(caption);
+                        tmpName = caption.ToString();
+                    }
+                     
+                    if (tmpName != null && tmpName != "")
+                    {     
+                        cpd.name = tmpName;
+                        int openbracket = cpd.name.IndexOf("(");
+                        int closebracket = cpd.name.IndexOf(")");
+                        cpd.name = cpd.name.Substring(openbracket + 1, closebracket - openbracket - 1);
+                    }
+
+                    var Did = port.Properties["DeviceID"].Value;
+                    string[]? Did1 = null;
+                    if (Did != null)
+                    {
+                        string? Dids = Did.ToString();
+                        if (Dids != null)
+                            Did1 = Dids.Split("\\");
+                    }
+                    if (Did1 != null && Did1.Length >= 1)
+                    {
+                        var sDid = Did1[1];
+                        bool vid = false;
+                        bool pid = false;
+                        ComPortsData kd = new ComPortsData();
+
+                        foreach (string a in sDid.Split("&"))
+                        {
+                            var aa = a.Split("_");
+                            if (Did1.Length >= 1)
+                            {
+                                Console.Write("     " + aa[0] + ": " + aa[1]);
+                                if (aa[0] == "VID")
+                                {
+                                    cpd.VID = aa[1];
+                                    foreach (ComPortsData k in settings.knownDevices)
+                                    {
+                                        if (aa[1] == k.VID)
+                                        {
+                                            vid = true;
+                                            kd = k;
+                                        }
+                                    }
+                                }
+                                else if (aa[0] == "PID")
+                                {
+                                    cpd.PID = aa[1];
+                                    if (aa[1] == kd.PID)
+                                    {
+                                        pid = true;
+                                    }
+                                }
+                            }
+                        }
+                        if (vid && pid)
+                        {
+                            if (cpd.name != null)
+                                portName = cpd.name;
+                        }
+                    }
+                    ports.Add(cpd);
+                    Console.WriteLine("");
+                }
+            }
+            return portName;
+        }
+
+        // Display Port values and prompt user to enter a port
+        // or if the settings contain values that match a connected
+        // device use that without asking
+        private static string SetPortName(string defaultPortName)
+        {
+            List<ComPortsData> ports = new List<ComPortsData>();
+            string portName = GetPorts(ref ports);
+
+            while (ports.Count() == 0)
+            {
+                portName = GetPorts(ref ports);
+            }
+
+            if (portName == "")
+            {
+                Console.Write("Enter COM port value (Default: {0}): ", defaultPortName);
+                string? consoleRead = Console.ReadLine();
+                if (consoleRead != null)
+                    portName = consoleRead;
+            }
+
+            portName = portName.ToUpper();
+            if (portName.StartsWith("COM"))
+            {
+                bool portValid = false;
+                ComPortsData chosenPort = new ComPortsData();
+                foreach (var cpd in ports)
+                {
+                    if (cpd.name == portName)
+                    {
+                        chosenPort = cpd;
+                        portValid = true;
+                    }
+                    break;
+                }
+                if (portValid)
+                {
+                    settings.knownDevices.Add(chosenPort);
+                    writeSettingsFile();
+                }
+                else
+                {
+                    portName = defaultPortName;
+                }
+            }
+            return portName;
+        }
+
+    }
+}
