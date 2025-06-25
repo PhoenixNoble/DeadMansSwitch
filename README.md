@@ -3,8 +3,8 @@ USB Kill Switch for laptops
 
 
 A Simple Dead Mans Switch for USB devices
-Based on an ESP32 and a USB magnetic breakaway cable (thinking about switching to ATTinyXX)
-ESP32 simoly reflects the message written to serial port
+Based on an ESP32 / PR2040 and a USB magnetic breakaway cable
+ESP32 / PR2040 simoly reflects the message written to serial port
 
 Windows locks PC if:
 * The app is closed after it is armed (no way to disarm)
